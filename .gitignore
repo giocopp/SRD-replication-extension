@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# R session state
+.Rhistory
+.Rapp.history
+.Rproj.user/
+*.Rproj
+
+# Quarto build artifacts
+final_project_cache/
+final_project_files/
+
+# Claude local config
+.claude/settings.local.json
+
+# Authors' replication package (not redistributed here; see README)
+data_explore/
