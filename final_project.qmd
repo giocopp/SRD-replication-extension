@@ -84,7 +84,21 @@ install_if_missing <- function(pkgs) {
 
 install_if_missing(c("dplyr", "purrr", "readr", "broom", "fixest",
                      "ggplot2", "dagitty", "ggdag", "knitr",
+                     "grf", "tidyr", "tibble",
                      "modelsummary", "kableExtra"))
+
+load_rdata <- function(path) {
+  e <- new.env()
+  load(path, envir = e)
+  e[[ls(e)[1]]]
+}
+
+coeftest_to_tibble <- function(ct) {
+  ct |>
+    unclass() |>
+    as_tibble(rownames = "term") |>
+    set_names(c("term", "estimate", "std_error", "t_value", "p_value"))
+}
 ```
 
 
@@ -230,12 +244,22 @@ I replicate **Table 2** of the paper, "The effect of depopulation on electoral r
 
 ## Code
 
-The seven models are fitted by `replication/replicate_table2.R`, which writes
-them to `replication/outcomes/table2_models.rds`. The document loads that
-file; it does not refit.
+```{r repl-fit, results='hide'}
+df <- load_rdata("replication/database/short_time.RData")
 
-```{r repl-fit}
-models <- readRDS("replication/outcomes/table2_models.rds")
+rhs <- "depo_cat_te + agriculture_workers + services_workers + unemployed +
+        var_older_te + var_younger_te + population_log | mun_code + year"
+
+fit_one <- function(y) {
+  fml <- as.formula(paste(y, "~", rhs))
+  tryCatch(
+    feols(fml, data = df, cluster = c("region", "mun_code", "year"), notes = FALSE),
+    error = \(e) feols(fml, data = df, cluster = c("mun_code", "year"), notes = FALSE))
+}
+
+models <- c("psoe", "pp", "podemos", "cs", "nswp", "es", "vox") |>
+  set_names() |>
+  map(fit_one)
 ```
 
 ## Results: replicated versus published
@@ -267,9 +291,11 @@ modelsummary::modelsummary(
 The replication reproduces the two depopulation coefficients in each column to four decimal places. For PSOE, PP, UP, Cs, PANES, and Vox, the standard errors also match the published estimates after rounding. The exception is the ES column, where the published article reports standard errors around $10^{-5}$ and highly significant coefficients, while the current rerun gives standard errors near 0.008 (Decrease) and 0.011 (Increase) with no stars. Sample sizes are slightly smaller in the rerun for every column. The side-by-side table below summarizes the comparison.
 
 ```{r repl-compare, echo=FALSE}
-key_rows <- c("depo_cat_te2_decrease", "depo_cat_te3_increase")
+key_rows     <- c("depo_cat_te2_decrease", "depo_cat_te3_increase")
+party_labels <- c(psoe = "PSOE", pp = "PP", podemos = "UP",
+                  cs = "Cs", nswp = "PANES", es = "ES", vox = "VOX")
 
-published <- tibble::tribble(
+published <- tribble(
   ~model,  ~dec_pub, ~dec_se_pub, ~inc_pub, ~inc_se_pub, ~N_pub,
   "PSOE",  -0.2329,   0.1064,        0.8166,    0.3345,    40400,
   "PP",     0.3811,   0.0567,        0.6904,    0.8576,    40400,
@@ -279,22 +305,23 @@ published <- tibble::tribble(
   "ES",    -0.0118,   0.00001,       0.0092,    0.00001,    7460,
   "VOX",    0.0822,   0.3423,       -0.3842,    0.5883,    32343)
 
-replicated <- purrr::imap_dfr(models, function(fit, name) {
-  td  <- broom::tidy(fit) |> dplyr::filter(term %in% key_rows)
-  dec <- td[td$term == "depo_cat_te2_decrease", ]
-  inc <- td[td$term == "depo_cat_te3_increase", ]
-  tibble::tibble(
-    model       = dplyr::recode(name, psoe="PSOE", pp="PP", podemos="UP",
-                                cs="Cs", nswp="PANES", es="ES", vox="VOX"),
-    dec_repl    = dec$estimate,    dec_se_repl = dec$std.error,
-    inc_repl    = inc$estimate,    inc_se_repl = inc$std.error,
-    N_repl      = fit$nobs)
-})
+replicated <- models |>
+  imap(\(fit, name) {
+    td <- broom::tidy(fit) |> filter(term %in% key_rows)
+    dec <- td |> filter(term == "depo_cat_te2_decrease")
+    inc <- td |> filter(term == "depo_cat_te3_increase")
+    tibble(
+      model       = party_labels[[name]],
+      dec_repl    = dec$estimate,  dec_se_repl = dec$std.error,
+      inc_repl    = inc$estimate,  inc_se_repl = inc$std.error,
+      N_repl      = fit$nobs)
+  }) |>
+  list_rbind()
 
 comparison <- published |>
-  dplyr::left_join(replicated, by = "model") |>
-  dplyr::transmute(
-    Party             = model,
+  left_join(replicated, by = "model") |>
+  transmute(
+    Party              = model,
     `Published (Dec.)`  = sprintf("%.4f (%.4f)", dec_pub,  dec_se_pub),
     `Replicated (Dec.)` = sprintf("%.4f (%.4f)", dec_repl, dec_se_repl),
     `Published (Inc.)`  = sprintf("%.4f (%.4f)", inc_pub,  inc_se_pub),
@@ -341,23 +368,57 @@ I focus on **Vox**. The controlled fixed-effects estimates show no average relat
 * **Missing data**: Vox is missing before the party entered the election data, so those observations drop out together with rows missing the selected covariates.
 * **Algorithm**: `grf::causal_forest` with 2000 trees and default tuning.
 
-## Pipeline
+## Code and fit
 
-The forest is fitted by `replication/extension_causal_forest.R`, which writes
-its derived quantities (ATE, calibration test, best linear projection,
-variable importance, population-quintile bins, and individual CATE
-predictions) to `replication/outcomes/tables/`. This document loads those
-tables and presents them; it does not refit the model.
+```{r ext-fit, results='hide'}
+covars <- c("agriculture_workers", "services_workers", "unemployed",
+            "var_older_te", "var_younger_te", "population_log",
+            "public_services", "degurba")
 
-```{r ext-load}
-ext_tables <- "replication/outcomes/tables"
+d_clean <- df |>
+  filter(depo_cat_te %in% c("1_no_change", "2_decrease")) |>
+  mutate(W               = as.integer(depo_cat_te == "2_decrease"),
+         public_services = as.numeric(public_services),
+         degurba         = as.numeric(degurba)) |>
+  filter(!is.na(vox),
+         if_all(all_of(covars), \(x) !is.na(x)))
 
-ate         <- read_csv(file.path(ext_tables, "ext_ate.csv"),                  show_col_types = FALSE)
-calibration <- read_csv(file.path(ext_tables, "ext_calibration.csv"),          show_col_types = FALSE)
-blp         <- read_csv(file.path(ext_tables, "ext_blp.csv"),                  show_col_types = FALSE)
-vi          <- read_csv(file.path(ext_tables, "ext_variable_importance.csv"),  show_col_types = FALSE)
-pop_bins    <- read_csv(file.path(ext_tables, "ext_population_bins.csv"),      show_col_types = FALSE)
-cates       <- read_csv(file.path(ext_tables, "ext_cates.csv"),                show_col_types = FALSE)$cate
+demeaned <- fixest::demean(
+  X = d_clean |> select(vox, W) |> as.matrix(),
+  f = d_clean |> select(mun_code, year) |> as.data.frame())
+
+X       <- d_clean |> select(all_of(covars)) |> as.matrix()
+Y_resid <- demeaned[, "vox"]
+W_resid <- demeaned[, "W"]
+
+set.seed(2026)
+cf <- grf::causal_forest(X, Y_resid, W_resid, num.trees = 2000, seed = 2026)
+
+ate_vec <- grf::average_treatment_effect(cf)
+ate     <- tibble(estimate  = ate_vec[["estimate"]],
+                  std_error = ate_vec[["std.err"]])
+calibration <- coeftest_to_tibble(grf::test_calibration(cf))
+blp         <- coeftest_to_tibble(grf::best_linear_projection(cf, X))
+cates       <- predict(cf)$predictions
+
+vi <- tibble(variable   = covars,
+             importance = grf::variable_importance(cf)[, 1]) |>
+  arrange(importance)
+
+pop_bins <- d_clean |>
+  transmute(
+    pop_quintile = cut(population_log,
+                       quantile(population_log, probs = seq(0, 1, .2)),
+                       include.lowest = TRUE,
+                       labels = c("Q1 (smallest)", "Q2", "Q3", "Q4", "Q5 (largest)")),
+    population   = exp(population_log),
+    cate         = cates) |>
+  group_by(pop_quintile) |>
+  summarise(n                 = n(),
+            median_population = median(population),
+            mean_CATE         = mean(cate),
+            median_CATE       = median(cate),
+            .groups = "drop")
 ```
 
 ## Is there heterogeneity at all?
@@ -375,7 +436,7 @@ calibration |>
 ## Distribution of CATEs
 
 ```{r ext-cate-dist, fig.width=7, fig.height=4, fig.cap="Distribution of estimated CATEs across the sample. The vertical line marks the average treatment effect from the forest; the histogram shows the spread of conditional effects."}
-ggplot(tibble::tibble(cate = cates), aes(cate)) +
+ggplot(tibble(cate = cates), aes(cate)) +
   geom_histogram(bins = 60, fill = "#2c7fb8", colour = "white", alpha = 0.9) +
   geom_vline(xintercept = ate$estimate, colour = "#d7301f", linewidth = 0.7) +
   annotate("text", x = ate$estimate, y = Inf, vjust = 2,
@@ -425,7 +486,7 @@ The variable-importance ranking points to size and composition. The top three mo
 
 ```{r ext-bins, echo=FALSE}
 pop_bins |>
-  dplyr::mutate(
+  mutate(
     median_population = formatC(round(median_population), big.mark = ",", format = "d"),
     n                 = formatC(n, big.mark = ",", format = "d"),
     mean_CATE         = sprintf("%.3f", mean_CATE),
